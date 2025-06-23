@@ -25,7 +25,10 @@ def home():
             'health': '/api/health',
             'test': '/api/test',
             'recommendations': '/api/recommendations/<user_id>',
-            'personalized_jobs': '/api/get-personalized-jobs'
+            'personalized_jobs': '/api/get-personalized-jobs',
+            'search_jobs': '/api/search-jobs',
+            'user_activity_insights': '/api/user-activity-insights/<user_id>',
+            'track_activity': '/api/track-activity'
         }
     })
 
@@ -37,7 +40,14 @@ def health_check():
 @app.route('/api/test', methods=['GET'])
 def test_route():
     logger.info("Test route accessed")
-    return jsonify({'success': True, 'message': 'Test route working!'})
+    # Test Appwrite connection
+    is_connected, message = appwrite_client.test_connection()
+    return jsonify({
+        'success': True, 
+        'message': 'Test route working!',
+        'appwrite_connection': is_connected,
+        'appwrite_message': message
+    })
 
 @app.route('/api/user/<user_id>', methods=['GET'])
 def get_user(user_id):
@@ -48,11 +58,14 @@ def get_user(user_id):
         else:
             return jsonify({'success': False, 'message': 'User not found'}), 404
     except Exception as e:
+        logger.error(f"Error in get_user: {str(e)}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
 @app.route('/api/recommendations/<user_id>', methods=['GET'])
 def get_recommendations(user_id):
     try:
+        logger.info(f"Getting recommendations for user: {user_id}")
+        
         # Get query parameters
         num_recommendations = int(request.args.get('limit', 10))
         job_type = request.args.get('jobType')
@@ -84,10 +97,10 @@ def get_recommendations(user_id):
             job = rec['job']
             formatted_recommendations.append({
                 'job': {
-                    'jobId': job.get('jobId'),
+                    'jobId': job.get('jobId') or job.get('$id'),
                     'jobRole': job.get('jobRole'),
                     'companyName': job.get('companyName'),
-                    'description': job.get('description', '')[:200] + '...',  # Truncate
+                    'description': job.get('description', '')[:200] + '...' if job.get('description') else '',
                     'location': job.get('location'),
                     'jobType': job.get('jobType'),
                     'experienceLevel': job.get('experienceLevel'),
@@ -101,8 +114,11 @@ def get_recommendations(user_id):
                     'skillMatch': round(rec['skill_score'] * 100, 2),
                     'locationMatch': round(rec['location_score'] * 100, 2),
                     'experienceMatch': round(rec['experience_score'] * 100, 2),
-                    'textSimilarity': round(rec['text_similarity'] * 100, 2)
-                }
+                    'contentSimilarity': round(rec['content_similarity'] * 100, 2),
+                    'activityScore': round(rec['activity_score'] * 100, 2)
+                },
+                'recommendationReason': rec['recommendation_reason'],
+                'hasActivityData': rec['has_activity_data']
             })
         
         return jsonify({
@@ -113,140 +129,176 @@ def get_recommendations(user_id):
         })
         
     except Exception as e:
+        logger.error(f"Error in get_recommendations: {str(e)}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
-# NEW ENDPOINT - This matches your frontend call
 @app.route('/api/get-personalized-jobs', methods=['POST'])
 def get_personalized_jobs():
     try:
         data = request.get_json()
+        logger.info(f"Getting personalized jobs with data: {data}")
         
         # Extract parameters from request
+        user_id = data.get('user_id')  # If user is logged in
         skills = data.get('skills', [])
         location = data.get('location', 'flexible')
         job_type = data.get('job_type', 'internship')
         experience_level = data.get('experience_level', 'entry')
         
-        # Create a mock user profile for the recommendation engine
-        mock_user_data = {
-            'skills': skills,
-            'location': location,
-            'experienceLevel': experience_level,
-            'education': '',  # Add if available
-        }
-        
-        # Get all jobs first
-        jobs_response = appwrite_client.get_jobs(limit=500)
-        if not jobs_response or not jobs_response.get('documents'):
+        # If user_id provided, use enhanced recommendation system
+        if user_id:
+            recommendations = recommendation_engine.get_recommendations(user_id, 20)
+            
+            # Format jobs for frontend
+            formatted_jobs = []
+            for rec in recommendations:
+                job = rec['job']
+                formatted_jobs.append({
+                    'id': job.get('jobId') or job.get('$id', ''),
+                    'title': job.get('jobRole', ''),
+                    'company': job.get('companyName', ''),
+                    'location': job.get('location', ''),
+                    'description': job.get('description', ''),
+                    'type': job.get('jobType', ''),
+                    'skills': job.get('skills', []),
+                    'salary': job.get('stipend', 'Salary not specified'),
+                    'apply_link': job.get('applyLink', '#'),
+                    'posted': 'Recently',
+                    'logo': f"https://logo.clearbit.com/{job.get('companyName', '').replace(' ', '').lower()}.com",
+                    'source': 'Gigrithm',
+                    'matchScore': round(rec['score'] * 100, 2),
+                    'recommendationReason': rec['recommendation_reason']
+                })
+            
             return jsonify({
-                'success': False,
-                'message': 'No jobs found',
-                'jobs': []
+                'success': True,
+                'jobs': formatted_jobs,
+                'total': len(formatted_jobs),
+                'personalized': True
             })
         
-        jobs = jobs_response['documents']
-        
-        # Calculate scores for each job using the recommendation engine logic
-        job_scores = []
-        
-        for job in jobs:
-            if not job.get('jobId') or not job.get('jobRole'):
-                continue
+        # If no user_id, use basic filtering
+        else:
+            # Create a mock user profile for the recommendation engine
+            mock_user_data = {
+                'skills': skills,
+                'location': location,
+                'experienceLevel': experience_level,
+                'education': '',
+            }
             
-            # Filter by job type if specified
-            if job_type != 'all' and job.get('jobType', '').lower() != job_type.lower():
-                continue
+            # Get all jobs first
+            jobs_response = appwrite_client.get_jobs(limit=500)
+            if not jobs_response or not jobs_response.get('documents'):
+                return jsonify({
+                    'success': False,
+                    'message': 'No jobs found',
+                    'jobs': []
+                })
             
-            # Calculate similarity scores
-            skill_score = recommendation_engine.calculate_skill_similarity(
-                skills, job.get('skills', [])
-            )
+            jobs = jobs_response['documents']
             
-            location_score = recommendation_engine.calculate_location_match(
-                location, job.get('location', '')
-            )
+            # Calculate scores for each job using the recommendation engine logic
+            job_scores = []
             
-            experience_score = recommendation_engine.calculate_experience_match(
-                experience_level, job.get('experienceLevel', '')
-            )
-            
-            # Text similarity
-            job_text = recommendation_engine.extract_features_from_job(job)
-            user_text = f"{' '.join(skills)} {experience_level}"
-            
-            try:
-                from sklearn.feature_extraction.text import TfidfVectorizer
-                from sklearn.metrics.pairwise import cosine_similarity
+            for job in jobs:
+                if not job.get('jobId') and not job.get('$id'):
+                    continue
+                if not job.get('jobRole'):
+                    continue
                 
-                vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
-                corpus = [user_text.lower(), job_text]
-                tfidf_matrix = vectorizer.fit_transform(corpus)
-                text_similarity = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
-            except:
-                text_similarity = 0.0
+                # Filter by job type if specified
+                if job_type != 'all' and job.get('jobType', '').lower() != job_type.lower():
+                    continue
+                
+                # Calculate similarity scores
+                skill_score = recommendation_engine.calculate_skill_similarity(
+                    skills, job.get('skills', [])
+                )
+                
+                location_score = recommendation_engine.calculate_location_match(
+                    location, job.get('location', '')
+                )
+                
+                experience_score = recommendation_engine.calculate_experience_match(
+                    experience_level, job.get('experienceLevel', '')
+                )
+                
+                # Content similarity
+                content_similarity = recommendation_engine.calculate_content_similarity(mock_user_data, job)
+                
+                # Weighted final score
+                final_score = (
+                    skill_score * 0.4 +
+                    content_similarity * 0.3 +
+                    location_score * 0.2 +
+                    experience_score * 0.1
+                )
+                
+                job_scores.append({
+                    'job': job,
+                    'score': final_score,
+                    'skill_score': skill_score,
+                    'location_score': location_score,
+                    'experience_score': experience_score,
+                    'content_similarity': content_similarity
+                })
             
-            # Weighted final score
-            final_score = (
-                skill_score * 0.4 +
-                text_similarity * 0.3 +
-                location_score * 0.2 +
-                experience_score * 0.1
-            )
+            # Sort by score
+            job_scores.sort(key=lambda x: x['score'], reverse=True)
             
-            job_scores.append({
-                'job': job,
-                'score': final_score,
-                'skill_score': skill_score,
-                'location_score': location_score,
-                'experience_score': experience_score,
-                'text_similarity': text_similarity
+            # Format jobs for frontend
+            formatted_jobs = []
+            for rec in job_scores[:20]:  # Return top 20
+                job = rec['job']
+                formatted_jobs.append({
+                    'id': job.get('jobId') or job.get('$id', ''),
+                    'title': job.get('jobRole', ''),
+                    'company': job.get('companyName', ''),
+                    'location': job.get('location', ''),
+                    'description': job.get('description', ''),
+                    'type': job.get('jobType', ''),
+                    'skills': job.get('skills', []),
+                    'salary': job.get('stipend', 'Salary not specified'),
+                    'apply_link': job.get('applyLink', '#'),
+                    'posted': 'Recently',
+                    'logo': f"https://logo.clearbit.com/{job.get('companyName', '').replace(' ', '').lower()}.com",
+                    'source': 'Gigrithm',
+                    'matchScore': round(rec['score'] * 100, 2)
+                })
+            
+            return jsonify({
+                'success': True,
+                'jobs': formatted_jobs,
+                'total': len(formatted_jobs),
+                'personalized': False
             })
-        
-        # Sort by score
-        job_scores.sort(key=lambda x: x['score'], reverse=True)
-        
-        # Format jobs for frontend (matching the expected format)
-        formatted_jobs = []
-        for rec in job_scores[:20]:  # Return top 20
-            job = rec['job']
-            formatted_jobs.append({
-                'id': job.get('jobId', job.get('$id', '')),
-                'title': job.get('jobRole', ''),
-                'company': job.get('companyName', ''),
-                'location': job.get('location', ''),
-                'description': job.get('description', ''),
-                'type': job.get('jobType', ''),
-                'skills': job.get('skills', []),
-                'salary': job.get('stipend', 'Salary not specified'),
-                'apply_link': job.get('applyLink', '#'),
-                'posted': 'Recently',  # You might want to add actual posting date
-                'logo': f"https://logo.clearbit.com/{job.get('companyName', '').replace(' ', '').lower()}.com",
-                'source': 'Gigrithm',
-                'matchScore': round(rec['score'] * 100, 2)
-            })
-        
-        return jsonify({
-            'success': True,
-            'jobs': formatted_jobs,
-            'total': len(formatted_jobs)
-        })
         
     except Exception as e:
         logger.error(f"Error in get_personalized_jobs: {str(e)}")
         return jsonify({'success': False, 'message': str(e), 'jobs': []}), 500
 
-# NEW ENDPOINT - For general job search (matching your default job search)
 @app.route('/api/search-jobs', methods=['GET'])
 def search_jobs():
     try:
         # Get query parameters
         query = request.args.get('q', '')
         location = request.args.get('location', 'all')
-        job_type = request.args.get('type', 'internship')
+        job_type = request.args.get('type', 'all')
+        experience_level = request.args.get('experience', 'all')
         limit = int(request.args.get('limit', 50))
         
-        # Get jobs from database
-        jobs_response = appwrite_client.get_jobs(limit=limit * 2)  # Get more to filter
+        logger.info(f"Searching jobs with query: {query}, location: {location}, type: {job_type}")
+        
+        # Get jobs from database with filters
+        if location != 'all' or job_type != 'all' or experience_level != 'all':
+            jobs_response = appwrite_client.get_jobs_by_filters(
+                location=location if location != 'all' else None,
+                job_type=job_type if job_type != 'all' else None,
+                experience_level=experience_level if experience_level != 'all' else None
+            )
+        else:
+            jobs_response = appwrite_client.get_jobs(limit=limit * 2)
         
         if not jobs_response or not jobs_response.get('documents'):
             return jsonify({
@@ -259,39 +311,33 @@ def search_jobs():
         filtered_jobs = []
         
         for job in jobs:
-            if not job.get('jobId') or not job.get('jobRole'):
+            if not job.get('jobId') and not job.get('$id'):
+                continue
+            if not job.get('jobRole'):
                 continue
             
-            # Filter by job type
-            if job_type != 'all' and job.get('jobType', '').lower() != job_type.lower():
-                continue
-            
-            # Filter by location
-            if location != 'all' and location != 'flexible':
-                job_location = job.get('location', '').lower()
-                if location.lower() not in job_location and 'remote' not in job_location:
-                    continue
-            
-            # Filter by search query
+            # Text search in job role, company name, and description
             if query:
-                searchable_text = f"{job.get('jobRole', '')} {job.get('companyName', '')} {job.get('description', '')}".lower()
-                if query.lower() not in searchable_text:
+                job_text = f"{job.get('jobRole', '')} {job.get('companyName', '')} {job.get('description', '')}".lower()
+                if query.lower() not in job_text:
                     continue
             
-            # Format job for frontend
+            # Format job for response
             formatted_job = {
-                'id': job.get('jobId', job.get('$id', '')),
+                'id': job.get('jobId') or job.get('$id', ''),
                 'title': job.get('jobRole', ''),
                 'company': job.get('companyName', ''),
                 'location': job.get('location', ''),
                 'description': job.get('description', ''),
                 'type': job.get('jobType', ''),
+                'experienceLevel': job.get('experienceLevel', ''),
                 'skills': job.get('skills', []),
                 'salary': job.get('stipend', 'Salary not specified'),
                 'apply_link': job.get('applyLink', '#'),
                 'posted': 'Recently',
                 'logo': f"https://logo.clearbit.com/{job.get('companyName', '').replace(' ', '').lower()}.com",
-                'source': 'Gigrithm'
+                'source': 'Gigrithm',
+                'category': job.get('category', '')
             }
             
             filtered_jobs.append(formatted_job)
@@ -302,46 +348,105 @@ def search_jobs():
         return jsonify({
             'success': True,
             'jobs': filtered_jobs,
-            'total': len(filtered_jobs)
+            'total': len(filtered_jobs),
+            'query': query
         })
         
     except Exception as e:
         logger.error(f"Error in search_jobs: {str(e)}")
         return jsonify({'success': False, 'message': str(e), 'jobs': []}), 500
 
-@app.route('/api/jobs', methods=['GET'])
-def get_jobs():
+@app.route('/api/user-activity-insights/<user_id>', methods=['GET'])
+def get_user_activity_insights(user_id):
     try:
-        limit = int(request.args.get('limit', 50))
-        jobs_response = appwrite_client.get_jobs(limit)
+        insights = recommendation_engine.get_user_activity_insights(user_id)
         
-        if jobs_response:
+        if insights:
             return jsonify({
                 'success': True,
-                'jobs': jobs_response['documents'],
-                'total': jobs_response['total']
+                'insights': insights,
+                'userId': user_id
             })
         else:
-            return jsonify({'success': False, 'message': 'No jobs found'}), 404
+            return jsonify({
+                'success': True,
+                'insights': None,
+                'message': 'No activity data found for user',
+                'userId': user_id
+            })
             
     except Exception as e:
+        logger.error(f"Error in get_user_activity_insights: {str(e)}")
         return jsonify({'success': False, 'message': str(e)}), 500
-    
-@app.route('/api')
-def api_info():
-    return jsonify({
-        'api': 'Job Recommendation System',
-        'version': '1.0',
-        'endpoints': [
-            {'path': '/api/health', 'method': 'GET', 'description': 'Health check'},
-            {'path': '/api/jobs', 'method': 'GET', 'description': 'Get all jobs', 'params': 'limit (optional)'},
-            {'path': '/api/search-jobs', 'method': 'GET', 'description': 'Search jobs', 'params': 'q, location, type, limit (all optional)'},
-            {'path': '/api/user/<user_id>', 'method': 'GET', 'description': 'Get user by ID'},
-            {'path': '/api/recommendations/<user_id>', 'method': 'GET', 'description': 'Get job recommendations', 'params': 'limit, jobType, location, category (all optional)'},
-            {'path': '/api/get-personalized-jobs', 'method': 'POST', 'description': 'Get personalized job recommendations', 'body': 'skills, location, job_type, experience_level'}
-        ]
-    })
+
+@app.route('/api/track-activity', methods=['POST'])
+def track_user_activity():
+    try:
+        data = request.get_json()
+        user_id = data.get('user_id')
+        job_id = data.get('job_id')
+        
+        if not user_id or not job_id:
+            return jsonify({
+                'success': False,
+                'message': 'user_id and job_id are required'
+            }), 400
+        
+        # Update user activity
+        result = appwrite_client.update_user_activity(user_id, job_id)
+        
+        if result:
+            return jsonify({
+                'success': True,
+                'message': 'Activity tracked successfully'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Failed to track activity'
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"Error in track_user_activity: {str(e)}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/debug/user-activity/<user_id>', methods=['GET'])
+def debug_user_activity(user_id):
+    """Debug endpoint to check user activity data"""
+    try:
+        # Get user activity
+        activity_data = appwrite_client.get_user_activity(user_id)
+        
+        # Get job IDs from activity
+        job_ids = recommendation_engine.get_user_activity_job_ids(user_id)
+        
+        # Get actual jobs from activity
+        recent_jobs = recommendation_engine.get_jobs_from_activity(user_id)
+        
+        # Get user preferences
+        user_preferences = recommendation_engine.analyze_user_preferences_from_activity(recent_jobs)
+        
+        return jsonify({
+            'success': True,
+            'debug_info': {
+                'activity_data': activity_data,
+                'job_ids_found': job_ids,
+                'valid_jobs_count': len(recent_jobs),
+                'user_preferences': user_preferences,
+                'recent_jobs_sample': [
+                    {
+                        'jobId': job.get('jobId'),
+                        'jobRole': job.get('jobRole'),
+                        'companyName': job.get('companyName')
+                    } for job in recent_jobs[:3]
+                ]
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in debug_user_activity: {str(e)}")
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(debug=False, host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=True)
